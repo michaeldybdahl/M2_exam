@@ -1,0 +1,1311 @@
+---
+title: "M2 - Exam - Network and NLP"
+author: "Malika Kuhlman & Michael Dybdahl"
+date: "10/24/2019"
+output:
+  pdf_document:
+    toc: yes
+  html_document:
+    code_folding: hide
+    df_print: paged
+    toc: yes
+    toc_float:
+      collapsed: yes
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, 
+                      warning = FALSE,
+                      message = FALSE,
+                      fig.align = "center")
+
+options(warn = -1) # Hides all warnings, as the knitr options only work on local R-Markdown mode. 
+
+Sys.setenv(LANG = "en") # For english language
+options(scipen = 5) # To deactivate annoying scientific number notation
+
+library(tidyverse) # Standard datascience toolkid
+library(magrittr) # For advanced piping (%>% et al.)
+library(tidytext)  # For text analysis
+library(tm) # text mining library
+library(quanteda)
+library(uwot) # for UMAP
+library(text2vec)
+library(tidygraph) # For tidy-style graph manipulation
+library(dplyr)
+library(gridExtra)
+library(grid)
+library(ggplot2)
+library(lattice)
+library(SnowballC) #To stem the words
+library(topicmodels)  #For LDA
+library(rsample) #for splitting data
+library(glmnet) #for ML
+library(broom) #for ML
+library(lubridate) #datestamp
+library(dbscan) #to plot clusters after LSA
+library(caret) #for ML - M1
+library(recipes) # for ML - M1
+library(e1071)# for ML - M1
+library(rpart.plot) #for ML - M1
+library(ranger) # for ML - M1
+library(ggraph)
+library(igraph) # For network analysis
+```
+
+**OBS** The notebook cannot be run in google Colab because of the *topicmodels* package.
+
+Loading the *stop_words* that we will use in the tokenization.
+
+```{r}
+set.seed(9)
+data("stop_words")
+```
+
+# Definition of a problem statement and a short outline of the implementation
+
+The link to our Github: https://github.com/michaeldybdahl/M2_exam
+
+## Problem statement
+
+How are the words in the text-reviews and based on a tidy format of the reviews, can we then compute any topics based on this? Can we compute a model that predict if a review is rated as a good review, based or linked to the NLP results?
+
+# Description of data acquisition / how it was collected (by you or the publisher of the data)
+
+The dataset contains reviews of some of amazons products, the dataset can be reached on this website https://data.world/datafiniti/consumer-reviews-of-amazon-products
+
+There are serveral datasets about the same topic, but with different amount of observations, we chose the dataset with $5000$ observations. 
+The dataset contains 24 variables and 5.000 observations (reviews).
+
+```{r}
+reviews <- read_csv("https://query.data.world/s/foqg5o75hazenbwqdug534atoqiyp3")
+```
+
+Have a look at the data structure
+
+```{r}
+glimpse(reviews)
+```
+
+# 1. Data preparation (general)
+
+## 1.1. Data cleaning
+
+We see that the data contains of $5000$ observations and $24$ variables, we are not going to use all of variables, therefore we now select the one we will use. Therefore we will only describe the variables we will use.
+
+```{r}
+reviews <- reviews %>%
+  select(reviews.username, 
+         dateAdded, 
+         name, 
+         primaryCategories, 
+         reviews.numHelpful, 
+         reviews.rating, 
+         reviews.text)
+```
+
+* **reviews.username:** contain the reviewsers username.
+* **dateAdded:** coontain the date the reviews was written.
+* **name:** contain the name of the product.
+* **primaryCategories:** contain the PRimary category of the product, there are four different primary categories in our data; *Electronics*, *Electronics, Hardware*, *Electronics, Media*and *Office Supplies, Electronics*.
+* **reviews.numHelpful:** contain a the value wether or not a reader found the review helpful.
+* **reviews.text:** contain the reviews of the product.
+
+Now we check for *NA* and drop them if any exists.
+
+```{r}
+sum(is.na(reviews)) # First we check for NA values in the whole datasat.
+
+reviews = reviews %>% 
+  drop_na()
+```
+
+## 1.2. Recoding
+
+We saw earlier that some of the variable are named *reviews.X*, this we want to change. 
+
+```{r}
+reviews <- reviews %>%
+  rename(helpful = reviews.numHelpful, 
+         rating = reviews.rating, 
+         text = reviews.text, 
+         username = reviews.username, 
+         date = dateAdded)
+```
+
+Have a look at the dataset now.
+
+```{r}
+glimpse(reviews)
+```
+
+Now we have a dataset with $4987$ observations and $9$ variables
+
+For later use, we add a new *ID* number to each username, since som users have reviewed more than one product.
+
+```{r}
+username_df <- reviews %>%
+  select(username) %>%
+  distinct(username, 
+           .keep_all = TRUE)
+
+username_df$ID <- seq.int(nrow(username_df))
+```
+
+Now we join the new ID with the dataset.
+
+```{r}
+reviews <- reviews %>%
+  left_join(username_df, by = "username") %>%
+  select(ID, everything())
+
+reviews$ID2 <- seq.int(nrow(reviews))
+```
+
+We change the rating from *doubble* to *factor*.
+
+```{r}
+reviews$rating <- as.factor(reviews$rating)
+```
+
+We change the date from *dttm* to *date*.
+
+```{r}
+reviews$date <- as.Date(as.POSIXct(reviews$date))
+```
+
+We create a new variable called *year*, where we put the year of every review.
+
+```{r}
+reviews <- reviews %>%
+  mutate(year = as.factor(year(date)))
+```
+
+Now we want to look into wich years the dataset has reviews from and how many reviews there are written in each year.
+
+```{r}
+reviews %>%
+  group_by(year) %>%
+  count()
+```
+
+We see we have four years
+
+* **2015** with $44$ reviews
+* **2016** with $1026$ reviews
+* **2017** with $2495$ reviews
+* **2018** with $1435$ reviews
+
+# 2. Natural Language Processing
+
+We now do all the NLP here, and afterwards we have a section containing all the Network analysis.
+
+## 2.1. NLP - preparation
+
+### 2.1.1. Tokenization
+
+In this section we are going to do a tokenization by removing *stop words*, *meaningless words*, *non-alphanumeric characters*, and so on.
+
+First we seperate every word in each review text.
+
+```{r}
+reviews_tidy <- reviews %>% 
+  select(ID2, ID, text) %>%
+  unnest_tokens(output = word, input = text)
+```
+
+```{r}
+head(reviews_tidy)
+```
+
+Then we remove *stop words*, using the stop_words we loaded in the begining.
+
+```{r}
+reviews_tidy %<>% # I use "%<>%" which both assigns and pipe - instead of first assigning and then piping. 
+  anti_join(stop_words, by = "word") # I use anti_join instead of filter, because it should be a bit faster.
+```
+
+Now we have a look at the most used words.
+
+```{r}
+reviews_tidy %>%
+  count(word, sort = TRUE) %>% # Count "word". "sort = TRUE" means that it will sort the words in descending order of number words.
+  head(20)
+```
+
+We see that words like *tablet*, *love* and *easy* are the most used words. Since the reviews are about *Electronics* we think thats why the word *Tablet* are the most used word togehter with *kindle*, *alexa* and *echo* wich all are names of some of the products.
+
+After a closer look into the words, we found some words that could be removed.
+
+```{r}
+own_stopwords <- tibble(word = c("bought", "yrs", "yokod", "yo", "xm", "wouldnt", "wouldn", "woo", "withunderstandably", "wished", "wi", "wellthis", "wellreasonably", "ample", "amazonso", "amazingly", "äîand"),
+                        lexicon = "OWN")
+```
+
+```{r}
+reviews_tidy %<>% # I use "%<>%" which both assigns and pipe - instead of first assigning and then piping. 
+  anti_join(own_stopwords, by = "word") # I use anti_join instead of filter, because it should be a bit faster.
+```
+
+Now we look at the top words again.
+
+```{r}
+reviews_tidy %>%
+  count(word, sort = TRUE) %>% # Count "word". "sort = TRUE" means that it will sort the words in descending order of number words.
+  head(20)
+```
+
+We see that the top words are different, since we removed some of our own stop words.
+
+Here we remowe numbers.
+
+```{r}
+reviews_tidy %<>%
+  mutate(word = trimws(gsub("[^\\s]*[0-9][^\\s]*", "", word, perl = T))) %>%
+  filter(str_length(word) > 1) # this filter out the words that are blank.
+```
+
+Here we remowe non-alphanumeric characters.
+
+```{r}
+reviews_tidy %<>%
+  mutate(word = word %>% str_remove_all("[^[:alnum:]]") ) %>% # alnum = Alphanumeric characters. 
+  filter(str_length(word) > 1) # filter out words with 1 character.
+```
+
+Now we look at the top $20$ of the least used words.
+
+```{r}
+reviews_tidy %>%
+  count(word, sort = TRUE) %>% # Count "word". "sort = TRUE" means that it will sort the words in descending order of number words.
+  top_n(-20)
+```
+
+We see that the list contains words, that are only used once, this could indicate that some mispelling have happend or its not a very usefull word. Therefore we remove words used less than two times.
+
+```{r}
+reviews_tidy = reviews_tidy %>%
+  add_count(ID, word, name = "nword") %>%
+  filter(nword > 1) %>%
+  select(-nword)
+```
+
+Have a look again
+
+```{r}
+reviews_tidy %>%
+  count(word, sort = TRUE) %>% # Count "word". "sort = TRUE" means that it will sort the words in descending order of number words.
+  top_n(-20)
+```
+
+We see some different words now, but we still find these words usefull and very informative.
+
+We now make varible only containing the words in descending order of how much they are used. 
+
+```{r}
+topwords <- reviews_tidy %>%
+  count(word, sort = TRUE)
+
+head(topwords)
+```
+
+We use this new *topwords* variable to plot the topwords.
+
+```{r}
+topwords %>%
+  top_n(20, n) %>%
+  ggplot(aes(x = word %>% fct_reorder(n), y = n)) + #fct_reorder factor the counts + it reorder the counts in a descending format.
+  geom_col() +
+  coord_flip() +
+  labs(title = "Word Counts", 
+       x = "Frequency", 
+       y = "Top Words")
+```
+ 
+ We see that the word *tablet* is way more than the rest. If we have a look at the other words, we see that overall the words are mainly the name of some electronics or the words are mainly about electronics.
+ 
+*For later use, we save this reviews_tidy with a different name* 
+ 
+```{r}  
+reviews_tidy_ML = reviews_tidy
+```
+
+## 2.2. Simple vectorization (Tf-idf)
+
+In this section we add the *tf, term of frequency*, *idf, inverse document frequency* and *tf-idf, term frequency–inverse document frequency* to the tidy data.
+  
+```{r}
+reviews_tidy <- reviews_tidy %>%
+  count(ID, word) %>%
+  bind_tf_idf(ID, word, n) # I use this function to add the "tf", "idf" & "tf_idf" values.
+```
+
+We have a look at the dwords with the highest *tf_idf* values
+
+```{r}
+reviews_tidy %>%
+  arrange(desc(tf_idf))
+```
+
+## 2.3. Topic modelling / Clustering (LSA)
+
+Now we will perform a LSA, which is stable when attempting to do dimensionality reduction as preprocessing for supervised ML workflows, or for visualization.
+
+We have loaded the quanteda package, which is for corpus-token based text analysis.
+
+First we have to create a document-feature-matrix
+
+```{r}
+reviews_dfm <- reviews_tidy %>%
+  count(ID, word) %>%
+  cast_dfm(document = ID, term = word, value = n)
+
+reviews_dfm
+```
+
+Now we get ready for the *LSA*, by choosing the number of dimensions.
+
+```{r}
+reviews_lsa <- reviews_dfm %>%
+  textmodel_lsa(nd = 5)
+```
+
+Let’s have a look
+
+```{r}
+reviews_lsa %>% 
+  glimpse()
+```
+
+Now we take the *LSA documents* and put them into a tibble, and adding the id’s as row names.
+
+```{r}
+reviews_lsa_loading <- reviews_lsa$docs %>%
+  as.data.frame() %>%
+  rownames_to_column(var = "ID") %>% 
+  as_tibble()
+
+reviews_lsa_loading %>%
+  head()
+```
+
+We can nicely visualize it using *UMAP* dimensionality reduction for optimizing the visualization of the feature space.
+
+```{r}
+reviews_lsa_umap = umap(reviews_lsa_loading %>%
+                         column_to_rownames("ID"),
+                       n_neighbors = 15,
+                       metric = "cosine",
+                       min_dist = 0.01,
+                       scale = TRUE,
+                       verbose = TRUE,
+                       n_threads = 8)
+```
+
+Then we put the result into a tibble for a nice layout.
+
+```{r}
+reviews_lsa_umap  = reviews_lsa_umap %>%
+  as.data.frame()
+```
+
+Now we can plot the result
+
+```{r}
+reviews_lsa_umap %>%
+  ggplot(aes(x = V1, y = V2)) +
+  geom_point(alpha = 0.5)
+```
+
+We see that the some of the points tend to cluster togehter.
+
+
+We now try to find clusters by using the *hdbscan*.
+```{r}
+reviews_lsa_hdbscan <- reviews_lsa_umap %>%
+  as.matrix() %>%
+  hdbscan(minPts = 50)
+```
+
+Let plot again, but now we color by clusters.
+
+```{r}
+reviews_lsa_umap %>%
+  bind_cols(cluster = reviews_lsa_hdbscan$cluster %>% as.factor(),
+            prob = reviews_lsa_hdbscan$membership_prob) %>%
+  ggplot(aes(x = V1, y = V2, col = cluster)) +
+  geom_point(aes(alpha = prob), shape = 21)
+```
+
+## 2.4. EDA / simple frequency-based analysis
+
+Now we look closer into rating, we want to see of some words tend to show more in one rating then the others.
+
+```{r}
+reviews_tidy3 = reviews_tidy %>%
+  left_join(reviews, by = "ID")
+```
+
+Now we plot the 20 most used words in each rating. 
+
+```{r}
+reviews_tidy3 %>%
+ count(rating, word, sort = TRUE) %>%
+ group_by(rating) %>%
+ top_n(10) %>%
+ ungroup() %>%
+ ggplot(aes(reorder_within(word, n, rating), n, fill = rating )) +
+ geom_col(alpha = 0.8, show.legend = FALSE) +
+ scale_x_reordered() +
+ coord_flip() +
+ facet_wrap(~rating, scales = "free") +
+ scale_y_continuous(expand = c(0, 0)) +
+ labs(x = NULL, y = "Word count", title = "20 Most frequent words in the 5 ratings")
+```
+
+we see that 
+
+* **Rating 1:** contains words like *constantly*, *returned*, *purchased* which could have a negative meaning and then there are a lot of words about the *electronics*.
+
+* **Rating 2:** contains words like *responsive*, *time*, *fix* which also could have a negative meaning, and here we also see words describing the *electronics*
+
+* **Rating 3:** contains words like the two other, but here the amount each words are used are almost the same for them all, except *tablet*. Therefore this looks loke the ones that don*t take this review seriously. 
+
+* **Rating 4:** containd words like *love*, *easy*, *price* and *product* this would usually have positive meaning in a text together with the describtion of the *electronic*.
+
+* **Rating 5:** contain words like *love(s)*, *easy*, *price*, wich are way more positive words than the first two ratings. We also see that the amount each words are used are way higher here.
+
+We now want to see why the amount each words are used differ that much through the ratings.
+
+```{r}
+reviews %>%
+  group_by(rating) %>%
+  count()
+```
+
+We see that most of the reviewers gave the product a rating at $4$ or $5$, this could explain the differens in the amount of the word.
+
+## 2.5. Topic modelling / Clustering (LDA)
+
+**Preparing the Data**
+
+For this application, we have to leave the tidy data, since the *topicmodels* package requires a document-term matrix as imput. We can easily produce it using the cast_dtm() function of tidytext. This matrix has to be term-frequency weighted, we do so using the *weightTf* function of the tm package for the weighting argument
+
+```{r}
+reviews_dtm = reviews_tidy %>%
+  count(ID, word) %>% #add a count of words in each id
+  cast_dtm(document = ID, #Column containing document IDs as string or symbol
+           term = word, #Column containing terms as string or symbol
+           value = n, #Column containing values as string or symbol
+           weighting = tm::weightTf) #The weighting function for the DTM/TDM 
+
+reviews_dtm
+```
+
+We see that the matrix is $100\%$ sparse with $1510$ documents and $1827$ terms, which is an artefact of text data generally. Now we try to see if we could reduce that somewhat by deleting less often used terms.
+
+```{r}
+reviews_dtm %>% removeSparseTerms(sparse = .99) #sparse is maximal allowed sparsity.
+```
+
+With max allowed sparsity at $99\%$ we only have $74$ terms out of $1827$, too little
+
+```{r}
+reviews_dtm %>% removeSparseTerms(sparse = .999) #sparse is maximal allowed sparsity.
+
+```
+
+With max allowed sparsity at $99.9\%$ we only have $806$ terms out of $1827$, we might have to accept a high level of sparsity in order to still have a meaningful number of unique words.
+
+Now we can perform an LDA, using the more accurate Gibbs sampling as method.
+
+```{r}
+reviews_lda <- reviews_dtm %>%
+  LDA(k = 5, 
+      method = "Gibbs",
+      control = list(seed = 9))
+```
+
+#### $\beta$ Word-Topic Association
+
+$\beta$ is an output of the LDA model, indicating the propability that a word occurs in a certain topic. Therefore, loking at the top probability words of a topic often gives a good intuition regarding its properties.
+
+```{r}
+# LDA output is defined for tidy(), so we can easily extract it
+lda_beta <- reviews_lda %>%
+  tidy(matrix = "beta") %>%
+  group_by(topic) %>%
+  arrange(topic, desc(beta)) %>% #the higher beta, the more a word is "used" in a topic
+  slice(1:15) %>%
+  ungroup()
+
+lda_beta %>% head()
+```
+
+We see that topic one have words like *easy*, *screen* and *kids* with high $\beta$ values.
+
+Now we plot the top $10$ words in each topic.
+
+```{r}
+lda_beta %>%
+  mutate(term = reorder_within(term, beta, topic)) %>% #reordering the term by beta in each topic
+  group_by(topic, term) %>% #first group by topic and then by term
+  arrange(desc(beta)) %>% #rearrange data in descending order by beta
+  ungroup() %>%
+  ggplot(aes(term, beta, fill = as.factor(topic))) + #aes for the plot
+  geom_col(show.legend = FALSE) + #Don't show legend
+  coord_flip() + #flip the graph, so the bars will be horizontal
+  scale_x_reordered() +
+  labs(title = "Top 10 terms in each LDA topic",
+       x = NULL, 
+       y = expression(beta)) +
+  facet_wrap(~ topic, nrow = 1, scales = "free")
+```
+
+* **Topic 1:** We see that topic one is about quality for *HIFI* stuff.
+
+* **Topic 2:** We see that topic two is mainly about reading. The word *Kindle* are top 1, but words like *books*, *read(ing)*, *light*, are also in here.
+
+* **Topic 3:** We see that topic three is re mess of different types of words.
+
+* **Topic 4:** We see that topic four is about *HIFI*, since words like *echo*, *alexa* and *music* are highly rated here.
+
+* **Topic 5:** We see that topic five is mainly about tablets, since the words like *tablet*, *fire* and *ipad* are in this topic. together with some other tablet related words. 
+
+
+Overall we can say that the topics are mainly split into categories and not rating like we did earlier.
+
+
+## 2.6. Embedding-model based vectorization (GloVe)
+
+First we create a corpus
+```{r}
+reviews_corpus <- reviews %>% 
+  corpus(docid_field = "ID", 
+         text_field = "text")
+```
+
+#### Select features
+Now we tokenize the corpus, we remove stopwords, punctuations, number and so on.
+
+```{r}
+reviews_toks <- tokens(reviews_corpus, what = "word",
+                     remove_numbers = TRUE, #Remove numbers
+                     remove_punct = TRUE, #remove dots
+                     remove_symbols = TRUE, #remove symbols
+                     remove_separators = TRUE, #remove seperators
+                     remove_url = TRUE, #remove url's
+                     ngrams = 1) %>% #allowing unigrams
+  tokens_tolower() %>% #only lower case letters
+  tokens_remove(pattern = stopwords()) %>% #remove stopwords
+  tokens_remove(pattern = own_stopwords$word) %>% #remove own words
+  tokens_remove(pattern = c("[^[:alnum:]]")) #remove all non alpha numeric
+
+
+reviews_toks %>% head(2)
+```
+
+and then we keep the names of the features that occur five times or more.
+
+```{r}
+feats <- dfm(reviews_toks, verbose = TRUE) %>%
+    dfm_trim(min_termfreq = 5) %>%
+    featnames()
+```
+
+#### Constructing the feature co-occurence matrix
+
+```{r}
+reviews_fcm <- fcm(reviews_toks, 
+                 context = "window", 
+                 count = "weighted", 
+                 weights = 1 / (1:5), 
+                 tri = TRUE)
+```
+
+#### Fit word embedding model
+
+Now we fit the *GloVe* model using *text2vec*
+
+*GloVe* is an unsupervised learning algorithm for obtaining vector representations for words. Training is performed on aggregated global word-word co-occurrence statistics from a corpus, and the resulting representations showcase interesting linear substructures of the word vector space.
+
+```{r}
+glove <- GlobalVectors$new(word_vectors_size = 50, #number of words in each vector 
+                           vocabulary = featnames(reviews_fcm), 
+                           x_max = 10)
+
+reviews_main <- fit_transform(reviews_fcm, 
+                            glove, 
+                            n_iter = 20) #number of iterations
+```
+
+#### Averagning learned word vectors
+
+The two vectors are main and context. According to the *Glove* paper, averaging the two word vectors results in more accurate representation.
+
+```{r}
+reviews_context <- glove$components
+dim(reviews_context)
+```
+
+We see that the dimension of this model is $50$ x $5614$.
+
+```{r}
+reviews_vectors <- as.dfm(reviews_main + t(reviews_context))
+```
+
+#### Examining term representations
+
+Now we can find the six closest word vectors for *kindle*.
+
+```{r}
+new <- reviews_vectors["kindle", ]
+
+# calculate the similarity
+cos_sim <- textstat_simil(reviews_vectors, new,
+                          margin = "documents", method = "cosine")
+
+head(sort(cos_sim[, 1], decreasing = TRUE), 6)
+```
+
+We see the words *fire*, *new*, *since*, *one* and *second* are the closest words to the word *kindle*
+
+The six closest word vectors for *tablet*.
+
+```{r}
+new <- reviews_vectors["tablet", ]
+
+# calculate the similarity
+cos_sim <- textstat_simil(reviews_vectors, new,
+                          margin = "documents", method = "cosine")
+
+head(sort(cos_sim[, 1], decreasing = TRUE), 6)
+```
+
+We see that the words like *good*, *great*, *price* and *kids* are the closest to the word *tablet*.
+
+As seen earlier the data caontains mostly of high rated reviews. Therefore it makes sence that the word *tablet*  follows by positive words like *great* and *good*.
+
+Now we make an average-vector-representations for the words
+
+```{r}
+reviews_main_tibble = reviews_main %>% 
+  as.data.frame() %>% #making a dataframe
+  rownames_to_column(var = "word") %>% #Row names
+  as_tibble() #for nice layout
+
+reviews_main_tibble %>% head()
+```
+
+Now we make a average-vector-representations for the reviews.
+
+```{r}
+reviews_tidy2 = reviews_toks %>%
+  dfm() %>%
+  tidy()
+
+reviews_vector2 = reviews_tidy2 %>%
+  inner_join(reviews_main_tibble, by = c("term" = "word")) #joining the data by word/term
+
+head(reviews_vector2)
+```
+
+```{r}
+reviews_vector2 = reviews_vector2 %>%
+  select(-term, -count) %>% #remove term and count
+  group_by(document) %>% #group the data by document
+  summarise_all(mean) %>% #finding the mean of the coloumns for each document
+  ungroup()
+```
+
+Let's have a look at the data
+
+```{r}
+reviews_vector2_umap <- umap(reviews_vector2 %>% column_to_rownames("document"),
+                       n_neighbors = 15,
+                       metric = "cosine",
+                       min_dist = 0.01,
+                       scale = TRUE,
+                       verbose = TRUE) %>%
+  as.data.frame()
+```
+
+```{r}
+reviews_vector2_umap %>%
+  ggplot(aes(x = V1, y = V2)) +
+  geom_point(shape = 21, alpha = 0.25)
+```
+
+It does not look like the data have any clusters right now. If we look closely we could argue about some few clusters at the plot, which might be *tablet* and/or *kindle* stuff.
+
+# 3. Supervised / Unsupervised ML
+
+## 3.1. Unsupervised ML
+
+We do *kmeans* for the *tf_idf* values, and want $5$ clusters since we have $5$ different ratings in the data.
+```{r}
+kmeans_tfidf = kmeans(reviews_tidy[,4:6], centers = 5, nstart = 20)
+```
+
+```{r}
+reviews_tidy = reviews_tidy %>%
+  bind_cols(cluster = kmeans_tfidf$cluster)
+```
+
+Now we plot the reviews_tidy, and color by clusters. 
+
+```{r}
+reviews_tidy %>%
+ mutate(cluster = as.factor(cluster)) %>%
+ count(cluster, word, sort = TRUE) %>%
+ group_by(cluster) %>%
+ top_n(20,n) %>%
+ ungroup() %>%
+ ggplot(aes(reorder_within(word, n, cluster), n,
+   fill = cluster
+ )) +
+ geom_col(alpha = 0.8, show.legend = FALSE) +
+ scale_x_reordered() +
+ coord_flip() +
+ facet_wrap(~cluster, scales = "free")  +
+ scale_y_continuous(expand = c(0, 0)) +
+ labs(x = NULL, y = "Word count",
+   title = "Most frequent words in the 5 clusters")
+```
+
+Unfortunately the plots are messy. since some of the clusters contain words represented the same amount of times. Therefore we can only talk/discuss plot $1$, $2$ and $5$.  
+
+The plots contain almost the same words, it is hard to find differences in these three plots.
+
+##  3.2. Supervised ML
+
+### 3.2.1. Method 1
+
+Now we want to get ready for modeling. We split the data into training and testing sets, using *rsample*. We use the original data, reviews,  because the reviews$text are our individual observations.
+
+```{r}
+reviews_split <- reviews %>%
+  select(ID2) %>%
+  initial_split() #by default it splits 3/4
+
+train_data <- training(reviews_split) #train data
+
+test_data <- testing(reviews_split) #test data
+```
+
+Now we transform our training data from a tidy structure to a sparse matrix, wich we will use for the machine learning algorithm.
+
+```{r}
+sparse_words =  reviews_tidy_ML %>%
+  count(ID2, word) %>%
+  inner_join(train_data) %>% #keep rows from Twwets_tidy where there are matching values in y, and all columns from x and y.
+  cast_sparse(ID2, word, n) #Create a sparse matrix from row names, column names, and values in a table
+```
+
+```{r}
+dim(sparse_words)
+```
+
+We see we get a sparse matrix with $1885$ rows and $1764$ columns. This means we have $1885$ training observations and $1764$ features at this point.
+
+Now we build a dataframe with response variable to associate each of the *rownames()* of the sparse matrix. We select the *rating*, since it will be our predictor later.
+
+```{r}
+word_rownames = as.integer(rownames(sparse_words))
+reviews_rating = reviews %>% select(ID2, rating)
+```
+
+```{r}
+reviews_joined = data_frame(ID2 = word_rownames) %>%
+  left_join(reviews_rating, by = "ID2" )
+```
+
+Now we want to train our classification model. We use *glmnet* to fit a logistic regression model with *LASSO* regularization. It’s a great fit for text classification because the variable selection that *LASSO* regularization performs can tell you which words are important for our prediction problem.
+
+We make five models, since we have five types of ratings.
+```{r}
+#Model for rate 1
+model_1 = cv.glmnet(sparse_words, # x variable = matrix .
+                    reviews_joined$rating == 1, #response variable
+                    family = "binomial",
+                    keep = TRUE) 
+
+#Model for rate 2
+model_2 <- cv.glmnet(sparse_words, #x variable = matrix .
+                    reviews_joined$rating == 2,  #response variable
+                    family = "binomial",
+                    keep = TRUE)
+
+#Model for rate 3
+model_3 <- cv.glmnet(sparse_words, #x variable = matrix .
+                    reviews_joined$rating == 3, #response variable
+                    family = "binomial",
+                    keep = TRUE)
+
+#Model for rate 4
+model_4 <- cv.glmnet(sparse_words, #x variable = matrix .
+                    reviews_joined$rating == 4, #response variable
+                    family = "binomial",
+                    keep = TRUE)
+
+#Model for rate 5
+model_5 <- cv.glmnet(sparse_words, #x variable = matrix .
+                    reviews_joined$rating == 5, #response variable
+                    family = "binomial",
+                    keep = TRUE)
+```
+
+Now we use *broom* to check the five models coeffecients. We also check for wich coefficients are largest in size, in each direction
+
+```{r}
+coef_1 <- model_1$glmnet.fit %>%
+  tidy() %>%
+  filter(lambda == model_1$lambda.1se) %>% #lambda with error within 1 standard error
+  group_by(estimate > 0) %>%
+  top_n(10, abs(estimate)) %>%
+  ungroup() %>%
+  ggplot(aes(fct_reorder(term, estimate),  #plotting the top words in each direction
+             estimate, 
+             fill = estimate > 0)) + 
+  geom_col(alpha = 0.8, show.legend = FALSE) +
+  coord_flip() +
+  scale_fill_brewer(palette = "Paired") +
+  labs( title = "Rate 1",
+       x = NULL)
+
+
+coef_2 <- model_2$glmnet.fit %>%
+  tidy() %>%
+  filter(lambda == model_2$lambda.1se) %>% #lambda with error within 1 standard error
+  group_by(estimate > 0) %>%
+  top_n(10, abs(estimate)) %>%
+  ungroup() %>%
+  ggplot( aes( fct_reorder( term, estimate), 
+               estimate, 
+               fill = estimate > 0)) +
+  geom_col(alpha = 0.8, show.legend = FALSE) +
+  coord_flip() +
+  scale_fill_brewer(palette = "Paired") +
+  labs( title = "Rate 2", 
+       x = NULL)
+
+
+coef_3 <- model_3$glmnet.fit %>%
+  tidy() %>%
+  filter(lambda == model_3$lambda.1se) %>% #lambda with error within 1 standard error
+  group_by(estimate > 0) %>%
+  top_n(10, abs(estimate)) %>%
+  ungroup() %>%
+  ggplot(aes(fct_reorder(term, estimate), 
+             estimate, 
+             fill = estimate > 0)) +
+  geom_col(alpha = 0.8, show.legend = FALSE) +
+  coord_flip() + #Horizontal barplot
+  scale_fill_brewer(palette = "Paired") +
+  labs(title = "Rate 3",
+       x = NULL)
+
+
+coef_4 <- model_4$glmnet.fit %>%
+  tidy() %>%
+  filter(lambda == model_4$lambda.1se) %>% #lambda with error within 1 standard error
+  group_by(estimate > 0) %>%
+  top_n(10, abs(estimate)) %>%
+  ungroup() %>%
+  ggplot(aes(fct_reorder(term, estimate), 
+             estimate, 
+             fill = estimate > 0)) +
+  geom_col(alpha = 0.8, show.legend = FALSE) +
+  coord_flip() + #Horizontal barplot
+  scale_fill_brewer(palette = "Paired") +
+  labs(title = "Rate 4",
+       x = NULL)
+
+
+coef_5 <- model_5$glmnet.fit %>%
+  tidy() %>%
+  filter(lambda == model_5$lambda.1se) %>% #lambda with error within 1 standard error
+  group_by(estimate > 0) %>%
+  top_n(10, abs(estimate)) %>%
+  ungroup() %>%
+  ggplot(aes(fct_reorder(term, estimate), 
+             estimate, 
+             fill = estimate > 0)) +
+  geom_col(alpha = 0.8, show.legend = FALSE) +
+  coord_flip() + #Horizontal barplot
+  scale_fill_brewer(palette = "Paired") +
+  labs(title = "Rate 5",
+       x = NULL)
+
+grid.arrange(coef_1, coef_2, coef_3, coef_4, coef_5, nrow = 1)
+```
+
+We see that not all the plots are very good, but we can see the meaning of some words for some topics.
+
+Now we try to classify the rating for the test set.
+
+```{r}
+model <- cv.glmnet(sparse_words, 
+                   reviews_joined$rating, 
+                   family = "multinomial", 
+                   keep = TRUE)
+
+coefs <- model$glmnet.fit %>%
+  tidy() %>%
+  filter(lambda == model$lambda.1se)
+
+intercept <- coefs %>%
+  filter(term == "(Intercept)") %>%
+  pull(estimate)
+
+classifications <- reviews_tidy_ML %>%
+  inner_join(test_data) %>% #Predicting the test data
+  inner_join(coefs, by = c("word" = "term")) %>%
+  group_by(class, ID2) %>%
+  summarize(score = sum(estimate)) %>%
+  mutate(probability = plogis(0 + score))
+```
+
+Let's have a look.
+
+```{r}
+classifications
+```
+
+We need to add the original rating, before we can say anything.
+
+```{r}
+res <- classifications %>% 
+  group_by(ID2) %>%  
+  filter(probability == max(probability)) %>%
+  left_join(reviews, by = "ID2")
+```
+
+Now we put the result in a table, where we can see if the classification did good or not.
+
+```{r}
+result <- table(res$rating, res$class)
+
+result
+```
+
+We see that the model is not that good, since it predicts $\sim 50\%$ correct.
+ 
+
+### 3.2.2. Method 2
+Here we try do like we saw in M1.
+
+We select our variables to the classification models.
+
+```{r}
+reviews_tidy_ML <- reviews_tidy3 %>%
+  select(tf, idf, 
+         tf_idf,
+         helpful,
+         rating, 
+         primaryCategories,
+         year) %>%
+  mutate(good_review = as.logical(as.integer(rating) >= 4, rating)) %>%
+  select(-rating) # I set class == 0, so class 0 is TRUE and the rest FALSE:
+```
+
+#### Splitting the data into train- and test set.
+
+```{r}
+index <- createDataPartition(y = reviews_tidy_ML$good_review, 
+                             p = 0.75, 
+                             list = FALSE) # 75% to 25% split
+
+training <- reviews_tidy_ML[index,]
+test <- reviews_tidy_ML[-index,]
+```
+
+#### Preprocessing using the recipes package.
+
+```{r}
+reci <- recipe(good_review ~ ., data = training) %>%
+  step_dummy(all_nominal(), -all_outcomes()) %>% # create dummy variables for the nominal variables
+  step_center(all_numeric(), -all_outcomes()) %>% # Centers all numeric variables to mean = 0
+  step_scale(all_numeric(), -all_outcomes()) %>% # this scales the numeric variables
+  step_zv(all_predictors())  # Removed predictors with zero variance
+
+reci %<>%
+  prep(data = train)
+```
+
+#### Setting the x and y values.
+
+```{r}
+# Predictors
+x_train <- bake(reci, new_data = training) %>% select(-good_review) # I remove class from the predictors.
+y_train <- training %>% pull(good_review) %>% as.factor()
+# test: split in y and x
+x_test <- bake(reci, new_data = test) %>% select(-good_review)
+y_test <- test %>% pull(good_review) %>% as.factor()
+```
+
+#### Setting the workflow.
+
+```{r}
+ctrl <- trainControl(method = "cv",
+                     number = 4)
+metric <- "Kappa" # I use Kappa because the class 0 (hate speech) is so low represented in the data.
+```
+
+#### Fitting the model - logistic regression.
+
+```{r}
+review_fit_log <- train(x = x_train,
+                 y = y_train,
+                 trControl = ctrl,
+                 metric = metric,
+                 method = "glm", 
+                 family = "binomial")
+```
+
+```{r}
+review_fit_log
+```
+
+#### Prediction and evaluating.
+
+```{r}
+pred_log <- predict(review_fit_log, newdata = x_test)
+```
+
+```{r}
+print("Confusion matrix for logistic model")
+confusionMatrix(pred_log, y_test, positive = 'TRUE')
+```
+
+#### Fitting the model - decision tree
+
+```{r}
+reviews_fit_dt <- train(x = x_train,
+                y = y_train,
+                trControl = ctrl,
+                metric = metric,
+                method = "rpart")
+```
+
+```{r}
+reviews_fit_dt
+```
+
+#### Predicting and evaluating
+
+```{r}
+pred_dt <- predict(reviews_fit_dt, newdata = x_test)
+```
+
+```{r}
+print("Confusion matrix for decision tree")
+confusionMatrix(pred_dt, y_test, positive = 'TRUE')
+```
+
+*We had some problems with the margins therefore we changed it.*
+
+```{r}
+par(mar = c(1,1,1,1)) #The margins for the next plot are too large
+```
+
+```{r}
+reviews_fit_dt$finalModel %>% 
+  rpart.plot()
+```
+
+#### Fitting the model - Random forest
+
+```{r}
+reviews_fit_rf <- train(x = x_train,
+                y = y_train,
+                trControl = ctrl,
+                metric = metric,
+                method = "ranger",
+                importance = "impurity", # To define how to measure variable importantce (later more)
+                num.trees = 25
+                )
+```
+
+```{r}
+reviews_fit_rf
+```
+
+#### Predicting and evaluating
+
+```{r}
+pred_rf <- predict(reviews_fit_rf, newdata = x_test)
+```
+
+```{r}
+print("Confusion matrix for Random forest")
+confusionMatrix(pred_rf, y_test, positive = 'TRUE')
+```
+
+# 4. Network Analysis
+
+In this section we are going to construct a network based on the reviews data.
+
+We did several constructions and tried interpret different attributes to the network, but for some reason we could not include any attributes. For example we wanted to try include *rating* and *primaryCategories* and use them for coloring or shaping the nodes
+
+
+#### Creating smaller sample of reviews.
+
+We first tried to create a network inclusing the whole dataset, but because of the size, we where not be able to run the network/graph *(the system crashed)*.
+
+Instead we resampled the review dataset to only 500 observations - so we instead got a datasat consiting of 500 reviews instead of 5.000.
+
+```{r}
+reviews_sampled <- reviews[sample(nrow(reviews),500),]
+```
+
+Now we create a tidy data as we did earlier, just on the resampled set.
+
+```{r}
+reviews_sampled_tidy <- reviews_sampled %>% 
+  select(ID, text) %>%
+  unnest_tokens(output = word, input = text) %>%
+  anti_join(stop_words %>% bind_rows(own_stopwords), by = "word") %>%
+  mutate(word = trimws(gsub("[^\\s]*[0-9][^\\s]*", "", word, perl = T))) %>%
+  filter(str_length(word) > 1) %>%# this filter out the words that are blank.
+  mutate(word = word %>% str_remove_all("[^[:alnum:]]") ) %>% # alnum = Alphanumeric characters. 
+  filter(str_length(word) > 1) # filter out words with 1 character.
+```
+
+To make a network not with too many words, we only use the 50 highest counted words in the tidy set. 
+
+```{r}
+sampled_50 <- reviews_sampled_tidy %>%
+  count(word, sort = TRUE) %>% # we count the words
+head(50) # we take the head of the 50 most frequent words.
+```
+
+Now we want the samlped tidy to only consist of the 50 most frequent words and here we use "left_join" to this.
+
+First we get a big dataset, but this is because we have all the words with "NA" values, which is the words that where not a part of the 50 most frequent words. Therefore we use *drop_na()* to drop the rows with NA values.
+
+```{r}
+reviews_sampled_tidy_joined <- reviews_sampled_tidy %>%
+  left_join(sampled_50, by = "word") %>%
+  drop_na()
+```
+
+Let's have a look.
+
+```{r}
+glimpse(reviews_sampled_tidy_joined)
+```
+
+We see that the data now consists of $1933$ observations and $3$ variables.
+
+Now we can create the nodelist from the sampled tidy dataset.
+
+```{r}
+nodes_reviews <- reviews_sampled_tidy_joined %>%
+  group_by(ID) %>%
+  select(word,ID) %>%
+  ungroup() %>%
+  distinct(word) # distinct does so we only retain the unique words from the nodelist -> so we dont get duplicate words/nodes.
+```
+
+Then we create a dataframe that we are going to be use for *left_joining* the edges (word.x and word.y)
+
+```{r}
+nodes4join <- reviews_sampled_tidy_joined %>%
+  select(ID, word)
+```
+
+```{r}
+g_reviews <- reviews_sampled_tidy_joined %>%
+  left_join(nodes4join, by = c("ID" = "ID"))
+```
+
+```{r}
+g_reviews <- g_reviews[c("word.x", "word.y")]
+```
+
+Here we transform the dataframe into a graph using *igraph*.
+
+We set *directed = FALSE*, because it is an undirected network.
+
+```{r}
+g_reviews <- graph_from_data_frame(d = g_reviews, 
+                                  directed = FALSE,
+                                  vertices = nodes_reviews)
+```
+
+We use *simplify* to remove loops and multiple edges. 
+
+```{r}
+g_reviews <- simplify(g_reviews, 
+                      remove.multiple = TRUE, 
+                      remove.loops = TRUE, 
+                      edge.attr.comb = igraph_opt("edge.attr.comb"))
+```
+
+Now we can plot the network.
+
+
+```{r}
+plot(g_reviews,
+     vertex.size = 1 + sqrt(degree(g_reviews, mode = "all"))) # we assign the size to the degree and add "1+sqrt", so we dont get too big nodes.
+```
+
+At the graph we see that the size based on the degree is not that different between the words, but is seems as *device*, *tablet* & *love* is connected by *ID* to many words. This is not that surprising, because these where also some of the topwords from earlier.
+
+Lets have a look at each nodes degree.
+
+```{r}
+degree(g_reviews) %>%
+  as.data.frame()
+```
+
+We can see that fx. *tap* only has degree $25$, but *love* has degree $49$. This makes sence, that not that many reviews has *tap* in the text, but rather more has *love* inside *(probably because the many high rated reviews)*.
+
+## Alternative solution
+We could have looked into bigrams and plot those as a network.
+
+```{r}
+bigrams <- reviews %>%
+  unnest_tokens(bigram, text, token = "ngrams", n = 2) # n is the number of words to conside
+```
+
+```{r}
+bigrams_separated <- bigrams %>% 
+  separate(bigram,c("word1","word2"),sep = " ")
+```
+
+```{r}
+bigrams_filtered <- bigrams_separated %>% 
+  filter(!word1 %in% stop_words$word) %>% 
+  filter(!word2 %in% stop_words$word) %>%
+  filter(!word1 %in% own_stopwords$word) %>% 
+  filter(!word2 %in% own_stopwords$word)
+```
+
+```{r}
+bigram_counts <- bigrams_filtered %>% 
+  count(word1, word2, sort = TRUE)
+```
+
+```{r}
+bigram_counts %>% 
+  head()
+```
+
+```{r}
+bigram_graph <- bigram_counts %>% 
+  filter(n > 15) %>%  #The occurence of the bigram is more than 15. 
+  graph_from_data_frame(directed = FALSE)
+```
+
+```{r}
+    bigram_graph %>% ggraph(layout = "fr") + 
+    geom_edge_link() + 
+    geom_node_point(aes(size = degree(bigram_graph), colour = degree(bigram_graph))) + 
+    scale_color_continuous(guide = "legend") + 
+    theme_graph() + 
+    geom_node_text(aes(label = name))
+```
+
+
